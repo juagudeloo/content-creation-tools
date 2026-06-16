@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import faster_whisper
+
 
 DEFAULT_MODEL = "small"
 DEFAULT_LANGUAGE = "es"
@@ -148,11 +150,6 @@ def resolve_device(device: str) -> str:
 
 
 def load_whisper_model(model_name: str, device: str, compute_type: str):
-    from importlib import import_module
-
-    whisper_module = import_module("faster_whisper")
-    whisper_model = whisper_module.WhisperModel
-
     preferred_compute_types = ["float16" if device == "cuda" else "float32", "int8_float16", "int8"]
     if compute_type != "auto":
         preferred_compute_types.append(compute_type)
@@ -160,14 +157,14 @@ def load_whisper_model(model_name: str, device: str, compute_type: str):
     last_error: Exception | None = None
     for candidate in preferred_compute_types:
         try:
-            return whisper_model(model_name, device=device, compute_type=candidate)
+            return faster_whisper.WhisperModel(model_name, device=device, compute_type=candidate)
         except ValueError as error:
             last_error = error
 
     if last_error is not None:
         raise last_error
 
-    return whisper_model(model_name, device=device, compute_type="float32")
+    return faster_whisper.WhisperModel(model_name, device=device, compute_type="float32")
 
 
 def normalize_text(text: str) -> str:

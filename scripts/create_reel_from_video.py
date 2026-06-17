@@ -15,6 +15,7 @@ MAX_REEL_SECONDS = 60
 PARAGRAPH_GAP = 1.5          # silence gap (seconds) that signals a new topic block
 MAX_PARAGRAPH_DURATION = 90  # force-split paragraphs longer than this (seconds)
 SIMILARITY_THRESHOLD = 0.25  # minimum cosine similarity to include a paragraph
+CLUSTER_GAP = 60             # seconds between relevant segments to start a new reel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = PROJECT_ROOT / ".venv"
@@ -177,6 +178,26 @@ def verify_reel(
     print(preview)
 
 
+def cluster_segments(
+    segments: List[Tuple[float, float]],
+) -> List[List[Tuple[float, float]]]:
+    """Group chronologically sorted segments into clusters by proximity.
+
+    Two segments whose gap exceeds CLUSTER_GAP start a new cluster, producing
+    a separate reel. This separates distinct occurrences of a topic (e.g. the
+    initial explanation vs. a later summary) without merging them.
+    """
+    if not segments:
+        return []
+    clusters: List[List[Tuple[float, float]]] = [[segments[0]]]
+    for s, e in segments[1:]:
+        if s - clusters[-1][-1][1] <= CLUSTER_GAP:
+            clusters[-1].append((s, e))
+        else:
+            clusters.append([(s, e)])
+    return clusters
+
+
 def trim_to_max_length(ranges: List[Tuple[float, float]], max_seconds: int) -> List[Tuple[float, float]]:
     """Fill the budget with the highest-relevance segments (ranges is relevance-ordered),
     then return the kept segments sorted chronologically for the video cut."""
@@ -256,24 +277,39 @@ def main() -> None:
     if not hits:
         raise SystemExit("No relevant segments found for that query.")
 
-    hits = trim_to_max_length(hits, args.max_seconds)
-    ffmpeg_trim_and_concat(input_video, hits, out)
+    # Group relevant segments by proximity: each cluster = one occurrence of the topic.
+    # Segments more than CLUSTER_GAP seconds apart become separate reels so that
+    # distinct mentions (e.g. initial explanation vs. closing summary) are not mixed.
+    clusters = cluster_segments(sorted(hits))
+    print(f"Found {len(clusters)} relevant section(s) → creating {len(clusters)} reel(s).")
 
-    gathered = []
-    reel_entries = []
-    for s, e in hits:
-        for start, end, text in entries:
-            if not (end <= s or start >= e):
-                gathered.append(text)
-                reel_entries.append((max(start, s), min(end, e), text))
+    for i, cluster in enumerate(clusters, start=1):
+        # Derive output paths: no suffix when there is only one reel (backward-compatible),
+        # numeric suffix otherwise.
+        if len(clusters) == 1:
+            reel_out = out
+        else:
+            reel_out = out.with_name(f"{out.stem}-{i}.mp4")
+        script_out = reel_out.with_name(f"{reel_out.stem}-script.txt")
+        srt_out = reel_out.with_name(f"{reel_out.stem}-en.srt")
 
-    script_txt = out.parent / f"{out.stem}-script.txt"
-    script_txt.write_text("\n\n".join(gathered), encoding="utf-8")
-    srt_out = out.parent / f"{out.stem}-en.srt"
-    write_reel_srt(reel_entries, srt_out)
+        trimmed = trim_to_max_length(cluster, args.max_seconds)
+        ffmpeg_trim_and_concat(input_video, trimmed, reel_out)
 
-    print(f"\nReel created: {out}\nScript: {script_txt}\nSRT: {srt_out}")
-    verify_reel(reel_entries, args.query, embed_model)
+        gathered = []
+        reel_entries = []
+        for s, e in trimmed:
+            for start, end, text in entries:
+                if not (end <= s or start >= e):
+                    gathered.append(text)
+                    reel_entries.append((max(start, s), min(end, e), text))
+
+        script_out.write_text("\n\n".join(gathered), encoding="utf-8")
+        write_reel_srt(reel_entries, srt_out)
+
+        label = f"Reel {i}/{len(clusters)}" if len(clusters) > 1 else "Reel"
+        print(f"\n{label}: {reel_out}\nScript: {script_out}\nSRT: {srt_out}")
+        verify_reel(reel_entries, args.query, embed_model)
 
 
 if __name__ == "__main__":

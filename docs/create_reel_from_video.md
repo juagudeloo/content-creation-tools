@@ -30,14 +30,15 @@ The default model (`paraphrase-multilingual-MiniLM-L12-v2`) is multilingual and 
 
    This order matters: picking by relevance first (not by earliest timestamp) ensures the most relevant section of the video ends up in the reel even if it appears after a less-relevant section that also cleared the threshold.
 
-8. **Clip and concatenate with ffmpeg**: each range is cut with `-c copy` (no re-encode) and joined via a concat list file.
+8. **Cluster into separate reels**: the selected segments are sorted chronologically and grouped by proximity. Any gap larger than `CLUSTER_GAP` (60 s) between two relevant segments starts a new cluster — and a new reel. This separates distinct occurrences of a topic (e.g. the initial concept explanation and the closing summary) instead of merging them into one video. Each cluster is trimmed independently to `--max-seconds`.
 
-9. **Write three outputs**:
-   - `<stem>-<query>-reel.mp4`
-   - `<stem>-<query>-reel-script.txt`
-   - `<stem>-<query>-reel-en.srt`
+9. **Clip and concatenate with ffmpeg** (once per cluster): each range is cut with `-c copy` (no re-encode) and joined via a concat list file.
 
-10. **Verification report**: after the reel is created, the script embeds the full reel transcript against the original query using the same model and prints a relevance score and short transcript preview. This lets you confirm the reel content corresponds to what was asked without having to watch the video.
+10. **Write outputs per reel**: if only one cluster is found, the original naming is used. Multiple clusters add a numeric suffix.
+    - `<stem>-<query>-reel.mp4` (single) or `<stem>-<query>-reel-1.mp4`, `-2.mp4`, … (multiple)
+    - Same pattern for `-script.txt` and `-en.srt`
+
+11. **Verification report per reel**: after each reel is created, the script embeds its full transcript against the original query and prints a relevance score and short preview. This lets you confirm each reel covers the right topic and compare which occurrence scored highest.
 
 ## Commands
 
@@ -64,7 +65,8 @@ python3 scripts/create_reel_from_video.py video.mp4 "fine tuning on drone images
 | `PARAGRAPH_GAP` | 1.5 s | Silence gap that signals a topic shift between cues. |
 | `MAX_PARAGRAPH_DURATION` | 90 s | Hard cap on paragraph length. Prevents continuous speech from collapsing into a single giant paragraph. Lower this if topics are short; raise it if you want broader context per segment. |
 | `SIMILARITY_THRESHOLD` | 0.25 | Minimum cosine similarity to include a paragraph. Lower to include more sections; raise to be stricter. |
-| `MAX_REEL_SECONDS` | 60 s | Default `--max-seconds` value. |
+| `CLUSTER_GAP` | 60 s | Gap between relevant segments that starts a new reel. Raise if the same topic recurs quickly; lower if you want tighter separation. |
+| `MAX_REEL_SECONDS` | 60 s | Default `--max-seconds` value. Applied per reel, not total. |
 
 ## Requirements
 

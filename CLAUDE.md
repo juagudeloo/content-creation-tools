@@ -79,6 +79,6 @@ After the reel is created, a **verification report** is printed: the full reel t
 
 In `generate_english_subtitles.py`: `MAX_CUE_CHARS` (84), `MAX_LINE_WIDTH` (42), `MIN_CUE_DURATION` (0.7 s), `DEFAULT_MODEL`, `DEFAULT_LANGUAGE`, `DEFAULT_OUTPUT_SUFFIX`.
 
-In `create_reel_from_video.py`: `MAX_REEL_SECONDS` (60 s), `PARAGRAPH_GAP` (1.5 s), `MAX_PARAGRAPH_DURATION` (90 s), `SIMILARITY_THRESHOLD` (0.25).
+In `create_reel_from_video.py`: `MAX_REEL_SECONDS` (60 s), `PARAGRAPH_GAP` (1.5 s), `MAX_PARAGRAPH_DURATION` (90 s), `SIMILARITY_THRESHOLD` (0.25), `CLUSTER_GAP` (60 s).
 
 Prefer adjusting these constants over hardcoding magic numbers elsewhere.

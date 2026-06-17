@@ -4,37 +4,81 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-script CLI tool that generates English subtitles for Spanish-language MP4 videos. It transcribes-and-translates the audio with `faster-whisper`, writes a well-formed `.srt`, and can optionally burn the subtitles into a new video via `ffmpeg`.
+A collection of CLI scripts for processing Spanish-language MP4 videos: transcribing and translating audio to English subtitles via `faster-whisper`, burning subtitle files into video, and cutting keyword-based short reels. All scripts invoke `ffmpeg` as a subprocess — it must be on `PATH`.
 
-There is only one source file: `scripts/generate_english_subtitles.py`. There is no test suite, linter config, or package manifest beyond `requirements.txt`.
+## Scripts
 
-## Running it
+| Script | Purpose |
+|--------|---------|
+| `scripts/generate_english_subtitles.py` | Transcribe + translate audio → `.srt` (self-bootstrapping venv) |
+| `scripts/burn_subtitles.py` | Burn an existing `.srt` into a video |
+| `scripts/create_reel_from_video.py` | Cut keyword-matched segments into a short reel |
+| `scripts/_utils.py` | Shared helpers: `render_burned_video`, `escape_path_for_ffmpeg` |
 
+## Running each script
+
+**Generate subtitles** (self-bootstrapping — invoke with system `python3`):
 ```bash
-python3 scripts/generate_english_subtitles.py <input_video.mp4> \
-    [--output-srt PATH] [--burned-video PATH] \
-    [--model small] [--language es] [--device cpu] \
-    [--compute-type auto] [--beam-size 5]
+python3 scripts/generate_english_subtitles.py <input.mp4> \
+    [--output-srt PATH] [--model small] [--language es] \
+    [--task translate|transcribe] \
+    [--device auto|cpu|cuda] [--compute-type auto] [--beam-size 5]
+```
+`--task translate` (default) outputs English. `--task transcribe` keeps the original language and names the output `<stem>.<language>.srt`.
+
+**Burn-only mode** (skip transcription, use existing SRT):
+```bash
+python3 scripts/generate_english_subtitles.py <input.mp4> \
+    --srt <subtitles.en.srt> --burned-video <output.mp4>
 ```
 
-- No manual setup is required: the script bootstraps its own `.venv` at the project root and installs `requirements.txt` into it on first run (see "Self-bootstrapping venv" below). Just invoke it with the system `python3`.
-- `--output-srt` defaults to `<input_stem>.en.srt` next to the input video.
-- `--burned-video`, if passed, produces a second MP4 with subtitles hard-coded into the picture.
-- `ffmpeg` must be installed and on `PATH` — it is invoked as a subprocess, not as a pip dependency.
+**Standalone burn**:
+```bash
+python3 scripts/burn_subtitles.py --video <input.mp4> --srt <subtitles.en.srt> [--out <output.mp4>]
+```
+
+**Create keyword reel** (auto-transcribes if no SRT is provided):
+```bash
+python3 scripts/create_reel_from_video.py <input.mp4> <keyword> \
+    [--sub-file <subtitles.en.srt>] [--out <reel.mp4>] [--max-seconds 60]
+```
+Outputs: `<keyword>-reel.mp4`, `<keyword>-reel-script.txt`, `<keyword>-reel-en.srt`.
 
 ## Architecture
 
-The script runs as a single linear pipeline in `main()`:
+### generate_english_subtitles.py pipeline
 
-1. **Self-bootstrapping venv** (`ensure_virtual_environment`): on every invocation, the script checks the `SUBTITLE_BOOTSTRAP_READY` env var. If unset, it creates `.venv/` (if missing), checks whether `faster_whisper` is importable inside it, installs `requirements.txt` if not, then re-executes itself (`os.execve`) using the venv's Python interpreter with the env var set. This means the body of `main()` always effectively runs under `.venv`'s interpreter, even though the user invokes the system `python3`. Keep this guard in mind when adding new dependencies — add them to `requirements.txt`, not to the system environment.
-2. **Audio extraction** (`extract_audio`): shells out to `ffmpeg` to pull mono 16kHz WAV audio into a temp dir.
-3. **Model load & device/compute resolution** (`load_whisper_model`, `resolve_device`): `--device auto` probes `ctranslate2.get_cuda_device_count()` to pick `cuda` vs `cpu`. Compute type tries a short list of candidates (`float16`/`float32` first, then `int8` variants) and falls back on `ValueError`, since not every backend supports every compute type.
-4. **Transcription** (`collect_cues`): calls `WhisperModel.transcribe(..., task="translate")` so Whisper directly outputs English text from Spanish (or `--language`) audio, with VAD filtering enabled.
-5. **Cue shaping** (`split_text_for_subtitles`, `chunk_by_words`, `wrap_for_srt`, `split_segment_into_cues`): Whisper's raw segments are often too long/run-on for subtitles. This stage splits long segment text on punctuation boundaries (falling back to word-chunking) to respect `MAX_CUE_CHARS`, then distributes timing across the resulting pieces proportionally to word count (bounded by `MIN_CUE_DURATION` per piece), and wraps each piece's text to `MAX_LINE_WIDTH` for two-line display. This is the most intricate part of the script — changes to subtitle pacing/formatting should go through here rather than in the SRT writer.
-6. **SRT writing** (`write_srt`, `format_timestamp`): standard SRT index/timestamp/text/blank-line format.
-7. **Optional burn-in** (`render_burned_video`): re-invokes `ffmpeg` with a `subtitles=filename=...` video filter; `escape_path_for_ffmpeg` escapes the path for ffmpeg's filtergraph syntax (colons, backslashes, quotes) since the subtitle path is passed inline in `-vf`.
+1. **Self-bootstrapping venv** (`ensure_virtual_environment`): checks `SUBTITLE_BOOTSTRAP_READY` env var; if unset, creates `.venv/`, installs `requirements.txt` if `faster_whisper` is not importable, then `os.execve`s itself under the venv's Python with the var set. `main()` body always runs under `.venv`. New dependencies go in `requirements.txt`, not the system env.
+2. **Audio extraction** (`extract_audio`): `ffmpeg` → mono 16kHz WAV in a temp dir.
+3. **Device/compute resolution** (`resolve_device`, `load_whisper_model`): `--device auto` probes `ctranslate2.get_cuda_device_count()`. Compute type tries `float16`/`float32` then `int8` variants, falling back on `ValueError`.
+4. **Transcription** (`collect_cues`): `WhisperModel.transcribe(..., task="translate")` outputs English directly from Spanish audio, with VAD filtering.
+5. **Cue shaping** (`split_text_for_subtitles`, `chunk_by_words`, `wrap_for_srt`, `split_segment_into_cues`): splits long Whisper segments on punctuation (fallback: word-chunking) to respect `MAX_CUE_CHARS`, distributes timing proportionally by word count (floor: `MIN_CUE_DURATION`), wraps to `MAX_LINE_WIDTH`. This is the most intricate stage — subtitle pacing/formatting changes belong here, not in the SRT writer.
+6. **SRT writing** (`write_srt`, `format_timestamp`): standard index/timestamp/text/blank-line format.
 
-## Notes for changes
+### Deliberate two-step design
 
-- This is not a git repository, so there's no commit history or branch state to inspect.
-- Tunable constants live at the top of the file (`MAX_CUE_CHARS`, `MAX_LINE_WIDTH`, `MIN_CUE_DURATION`, `DEFAULT_MODEL`, `DEFAULT_LANGUAGE`, `DEFAULT_OUTPUT_SUFFIX`) — prefer adjusting these over hardcoding new magic numbers elsewhere.
+`generate_english_subtitles.py` will NOT transcribe and burn in one command. Passing `--burned-video` without `--srt` raises an error. Use `--srt` + `--burned-video` together (burn-only mode) or use `scripts/burn_subtitles.py`.
+
+### Burn-in helpers (scripts/_utils.py)
+
+`render_burned_video` shells out to `ffmpeg` with a `subtitles=filename=...` video filter (libx264, crf 18, aac 192k). `escape_path_for_ffmpeg` escapes colons, backslashes, and quotes for ffmpeg's filtergraph syntax. Touch this carefully — path escaping failures are silent and produce corrupt video.
+
+### create_reel_from_video.py
+
+Has its own self-bootstrapping venv (env var `REEL_BOOTSTRAP_READY`) that installs `sentence-transformers`.
+
+If no `--sub-file` is given, calls `generate_english_subtitles.py` with `--task transcribe --language es` to produce a Spanish SRT (preserving original phrasing for better embedding accuracy).
+
+Cues are grouped into topic **paragraphs** by two rules: silence gap > `PARAGRAPH_GAP` (1.5 s) or paragraph length > `MAX_PARAGRAPH_DURATION` (90 s). The duration cap is essential for videos with continuous speech — without it, the entire video can collapse into 2–3 paragraphs and the semantic signal gets diluted.
+
+Each paragraph is embedded with `paraphrase-multilingual-MiniLM-L12-v2` (default) and ranked by cosine similarity to the query. Paragraphs above `SIMILARITY_THRESHOLD` (0.25) are selected. The budget (`--max-seconds`, default 60) is filled by taking the **highest-scoring** paragraphs first (not the earliest), then re-sorting them chronologically for the video cut. This prevents a lower-relevance early paragraph from consuming the budget before the truly relevant section is reached.
+
+After the reel is created, a **verification report** is printed: the full reel transcript is embedded against the query and a relevance score (0–1) is shown alongside a transcript preview.
+
+## Tunable constants
+
+In `generate_english_subtitles.py`: `MAX_CUE_CHARS` (84), `MAX_LINE_WIDTH` (42), `MIN_CUE_DURATION` (0.7 s), `DEFAULT_MODEL`, `DEFAULT_LANGUAGE`, `DEFAULT_OUTPUT_SUFFIX`.
+
+In `create_reel_from_video.py`: `MAX_REEL_SECONDS` (60 s), `PARAGRAPH_GAP` (1.5 s), `MAX_PARAGRAPH_DURATION` (90 s), `SIMILARITY_THRESHOLD` (0.25).
+
+Prefer adjusting these constants over hardcoding magic numbers elsewhere.

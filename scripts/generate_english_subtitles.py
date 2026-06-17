@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import faster_whisper
+from scripts._utils import escape_path_for_ffmpeg, render_burned_video
 
 
 DEFAULT_MODEL = "small"
@@ -78,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Beam size for Whisper decoding.",
     )
+    parser.add_argument(
+        "--srt",
+        type=Path,
+        help="Optional path to an existing SRT. When provided together with --burned-video, the script will only burn that SRT into the video and exit.",
+    )
+    parser.add_argument(
+        "--task",
+        default="translate",
+        choices=["translate", "transcribe"],
+        help="Whisper task. 'translate' outputs English text from any language (default); 'transcribe' keeps the original language.",
+    )
     return parser.parse_args()
 
 
@@ -114,8 +126,9 @@ def ensure_virtual_environment() -> None:
     os.execve(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 
-def default_output_path(input_video: Path) -> Path:
-    return input_video.with_name(f"{input_video.stem}{DEFAULT_OUTPUT_SUFFIX}")
+def default_output_path(input_video: Path, task: str = "translate", language: str = DEFAULT_LANGUAGE) -> Path:
+    suffix = DEFAULT_OUTPUT_SUFFIX if task == "translate" else f".{language}.srt"
+    return input_video.with_name(f"{input_video.stem}{suffix}")
 
 
 def extract_audio(input_video: Path, output_audio: Path) -> None:
@@ -271,10 +284,10 @@ def split_segment_into_cues(start: float, end: float, text: str) -> list[Cue]:
     return cues
 
 
-def collect_cues(model: Any, audio_path: Path, language: str, beam_size: int) -> list[Cue]:
+def collect_cues(model: Any, audio_path: Path, language: str, beam_size: int, task: str = "translate") -> list[Cue]:
     segments, _info = model.transcribe(
         str(audio_path),
-        task="translate",
+        task=task,
         language=language,
         beam_size=beam_size,
         vad_filter=True,
@@ -308,53 +321,35 @@ def write_srt(cues: Iterable[Cue], output_srt: Path) -> None:
     output_srt.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def escape_path_for_ffmpeg(path: Path) -> str:
-    resolved = path.resolve().as_posix()
-    return resolved.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
-
-
-def render_burned_video(input_video: Path, subtitle_file: Path, output_video: Path) -> None:
-    output_video.parent.mkdir(parents=True, exist_ok=True)
-    subtitle_filter = f"subtitles=filename='{escape_path_for_ffmpeg(subtitle_file)}'"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_video),
-        "-vf",
-        subtitle_filter,
-        "-c:v",
-        "libx264",
-        "-crf",
-        "18",
-        "-preset",
-        "medium",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        str(output_video),
-    ]
-    subprocess.run(command, check=True)
+# rendering helpers moved to scripts/_utils.py and imported above
 
 
 def main() -> None:
     ensure_virtual_environment()
     args = parse_args()
     input_video = args.input_video.resolve()
-    output_srt = (args.output_srt or default_output_path(input_video)).resolve()
+    output_srt = (args.output_srt or default_output_path(input_video, args.task, args.language)).resolve()
     burned_video = args.burned_video.resolve() if args.burned_video else None
+    provided_srt = args.srt.resolve() if args.srt else None
     device = resolve_device(args.device)
+
+    # If the user provided an SRT and an explicit burned-video path, only burn and exit.
+    if provided_srt is not None and burned_video is not None:
+        render_burned_video(input_video, provided_srt, burned_video)
+        return
+
+    # Do not allow --burned-video without specifying --srt. To burn, either use --srt with this script
+    # or use the dedicated `scripts/burn_subtitles.py` utility.
+    if burned_video is not None and provided_srt is None:
+        raise SystemExit("Refusing to run full pipeline and burn in one step. Provide --srt for burning or use scripts/burn_subtitles.py")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_audio = Path(temp_dir) / "audio.wav"
         extract_audio(input_video, temp_audio)
         model = load_whisper_model(args.model, device=device, compute_type=args.compute_type)
-        cues = collect_cues(model, temp_audio, args.language, args.beam_size)
+        cues = collect_cues(model, temp_audio, args.language, args.beam_size, task=args.task)
         write_srt(cues, output_srt)
-
-    if burned_video is not None:
-        render_burned_video(input_video, output_srt, burned_video)
+    # Generate only: burning must be done explicitly with --srt or with scripts/burn_subtitles.py
 
 
 if __name__ == "__main__":

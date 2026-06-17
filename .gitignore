@@ -1,6 +1,7 @@
 .venv
 prompt.md
-
+*.srt
+*.mp4
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

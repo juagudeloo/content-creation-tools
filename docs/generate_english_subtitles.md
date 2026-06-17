@@ -1,6 +1,6 @@
 # Subtitle Generator Docs
 
-This project has one source file, [scripts/generate_english_subtitles.py](../scripts/generate_english_subtitles.py), and one dependency file, [requirements.txt](../requirements.txt). The script is a single linear pipeline that extracts audio from a Spanish MP4, translates it to English subtitles, writes an SRT file, and can optionally burn the subtitles into a new video.
+This project has one core source file, [scripts/generate_english_subtitles.py](../scripts/generate_english_subtitles.py), which is a linear pipeline that extracts audio from a Spanish MP4, translates it to English subtitles, and writes an SRT file. The burning of subtitles is now handled by a separate script ([scripts/burn_subtitles.py](burn_subtitles.md)) to keep concerns separated.
 
 ## What the script does, step by step
 
@@ -9,10 +9,12 @@ This project has one source file, [scripts/generate_english_subtitles.py](../scr
 `main()` starts by calling `parse_args()`. The script accepts:
 
 - the input MP4 path
-- an optional output SRT path
-- an optional burned-in output video path
+- an optional output SRT path (`--output-srt`)
+- an optional burned-in output video path (`--burned-video`)
+- an optional path to an existing SRT (`--srt`) — see burn-only mode below
 - Whisper model selection
 - input language
+- task: `translate` (default) or `transcribe` — see step 6 below
 - device selection
 - compute type selection
 - beam size
@@ -64,9 +66,10 @@ If a backend does not support a candidate compute type, the code falls back to t
 
 ### 6. Transcribe and translate the speech
 
-`collect_cues()` calls `model.transcribe(..., task="translate")`.
+`collect_cues()` calls `model.transcribe(..., task=task)` where `task` comes from `--task` (default: `translate`).
 
-That `task="translate"` setting is the key behavior: Whisper converts the Spanish speech directly into English text instead of just transcribing the original language.
+- **`translate`** (default): Whisper converts the Spanish speech directly into English text. Use this for subtitle files meant to be displayed over the video.
+- **`transcribe`**: Whisper keeps the original language. Output is named `<stem>.<language>.srt` (e.g., `video.es.srt`). Use this when the text will be analyzed in its source language — for example, by `create_reel_from_video.py`, which uses a multilingual embedding model and gets better results from Spanish text than from an English translation.
 
 The transcription also enables VAD filtering so silence and pauses do not become subtitle noise.
 
@@ -95,11 +98,21 @@ This is the most important formatting stage in the project. It controls subtitle
 
 `format_timestamp()` converts seconds into the `HH:MM:SS,mmm` format expected by SRT readers.
 
-### 9. Optionally burn subtitles into a new video
+### 9. Burn-only mode (skip transcription)
 
-If `--burned-video` is provided, `render_burned_video()` runs `ffmpeg` again with a `subtitles=` video filter.
+If you already have an SRT and only want to burn it into a video, pass both `--srt` and `--burned-video`:
 
-`escape_path_for_ffmpeg()` is important here because subtitle paths are embedded inside the filtergraph string, so colons, backslashes, and quotes must be escaped correctly.
+```bash
+python3 scripts/generate_english_subtitles.py input.mp4 \
+    --srt input.en.srt --burned-video input.burned.mp4
+```
+
+When both flags are present, `main()` calls `render_burned_video()` and exits immediately — no audio extraction, no model load, no transcription. Passing `--burned-video` without `--srt` is an error; use `scripts/burn_subtitles.py` for a dedicated burn workflow.
+
+The recommended workflow is:
+1. Generate `.srt` with this script
+2. Review and edit the SRT if needed
+3. Burn with `--srt` + `--burned-video` here, or with [scripts/burn_subtitles.py](burn_subtitles.md)
 
 ### 10. Clean up temporary files automatically
 

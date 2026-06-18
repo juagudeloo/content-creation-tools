@@ -1,10 +1,28 @@
+# Single dependency set for both the CLI scripts and the Gradio app (one .venv).
+#
+# Everything is pinned to the gradio-4.44 era because gradio-path-selector is a
+# gradio 4.x custom component. That, in turn, forces huggingface_hub < 1.0
+# (gradio 4.44 still imports HfFolder), so transformers is held at 4.x — the last
+# line that works with that hub. These pins are interdependent; change them as a
+# set, not individually.
+
+# ── Gradio front-end ──────────────────────────────────────────────────────────
+gradio==4.44.1
+gradio-client==1.3.0
+gradio-path-selector==0.1.3
+fastapi==0.112.4          # newer fastapi/starlette break gradio 4.44's index route
+starlette==0.38.6
+pillow>=10.0.0
+
+# ── Transcription / semantic clip extraction (CLI scripts) ───────────────────
 faster-whisper>=1.1.0
-sentence-transformers>=3.0.0
+transformers>=4.40,<5
+sentence-transformers>=2.7,<3.1
+huggingface_hub>=0.23,<1.0
 pyyaml>=6.0
 
 # Optional (local-only) model and embedding libraries. Install only if you plan to run local LLMs or embeddings.
 # Examples:
 # gpt4all
 # llama-cpp-python
-# sentence-transformers
 # ffmpeg-python

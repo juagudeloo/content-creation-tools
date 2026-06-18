@@ -56,8 +56,10 @@ result is shown in a player / download box.
 
 Tabs: **Generate subtitles**, **Burn subtitles** (with a live SRT editor — save
 with `Ctrl+S`), and **Create reel** with two modes — *Clip creation*
-(semantic keyword cut) and *Reel compilation* (snapshot a region, pick time
-intervals, and compile the selected clips into one vertical reel).
+(semantic keyword cut) and *Reel compilation* (snapshot a frame, **draw the crop
+box** right on it — locked to the 9:16 reel shape and synced with the numeric
+fields — pick time intervals, and compile the selected clips into one vertical
+reel).
 
 > The app and scripts share one `.venv`, pinned to the gradio-4.44 era because
 > `gradio-path-selector` is a gradio 4.x component (see the note in

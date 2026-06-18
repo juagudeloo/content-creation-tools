@@ -10,6 +10,7 @@
 gradio==4.44.1
 gradio-client==1.3.0
 gradio-path-selector==0.1.3
+gradio_image_annotation==0.4.1
 fastapi==0.112.4          # newer fastapi/starlette break gradio 4.44's index route
 starlette==0.38.6
 pillow>=10.0.0

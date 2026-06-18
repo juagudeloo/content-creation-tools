@@ -92,7 +92,7 @@ import gradio.networking as _gr_networking  # noqa: E402
 _gr_networking.url_ok = lambda url: True
 
 from gradio_path_selector import PathSelector  # noqa: E402
-from PIL import Image, ImageDraw  # noqa: E402
+from gradio_image_annotation import image_annotator  # noqa: E402
 
 # Reuse the existing scripts as a library (importing does NOT trigger their
 # own bootstrap — that only happens inside their main()).
@@ -311,7 +311,7 @@ def load_reel_source(video_path: str):
     video = _clean_path(video_path)
     if video is None or not video.exists():
         msg = "Upload a video to begin." if not video_path else f"❌ Video not found: {video_path}"
-        return (None, None, gr.update(), gr.update(), 0, 0, 0, 0, 0, msg)
+        return (None, None, gr.update(), gr.update(), 0, 0, 0, 0, 0, msg, None)
     video = video.resolve()
     src_w, src_h = video_dimensions(video)
     duration = video_duration(video)
@@ -325,34 +325,92 @@ def load_reel_source(video_path: str):
         x, y, w, h,                                            # crop x/y/w/h
         0,                                                     # interval start
         status,
+        (x, y, w, h),                                          # crop_state guard
     )
 
 
-def overlay_image(dims: Optional[Dict], snapshot_path: Optional[str], x, y, w, h):
-    if not snapshot_path or not Path(snapshot_path).exists():
+# ── 9:16 reel-crop geometry (shared by the draw canvas and the number fields) ──
+
+REEL_RATIO = 9 / 16  # width / height — a reel crop must always keep this shape.
+
+
+def _clamp_crop(x, y, w, h, src_w, src_h):
+    w = max(16, min(int(round(w)), src_w))
+    h = max(16, min(int(round(h)), src_h))
+    x = max(0, min(int(round(x)), src_w - w))
+    y = max(0, min(int(round(y)), src_h - h))
+    return x, y, w, h
+
+
+def snap_to_reel(x, y, w, h, src_w, src_h, drive="h"):
+    """Force a crop box to 9:16, deriving the missing side, clamped to the frame.
+
+    drive='h' keeps the height and derives the width (used when drawing / editing
+    height); drive='w' keeps the width and derives the height.
+    """
+    x, y, w, h = float(x), float(y), float(w), float(h)
+    if drive == "w":
+        h = w / REEL_RATIO
+    else:
+        w = h * REEL_RATIO
+    # If the derived side overflows the frame, shrink from the other side.
+    if h > src_h:
+        h = src_h
+        w = h * REEL_RATIO
+    if w > src_w:
+        w = src_w
+        h = w / REEL_RATIO
+    return _clamp_crop(x, y, w, h, src_w, src_h)
+
+
+def crop_to_box(x, y, w, h):
+    return {"xmin": int(x), "ymin": int(y), "xmax": int(x + w), "ymax": int(y + h),
+            "label": "reel", "color": (0, 230, 0)}
+
+
+def annot_value(image: Optional[str], x, y, w, h):
+    if not image:
         return None
-    img = Image.open(snapshot_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    try:
-        x, y, w, h = int(x), int(y), int(w), int(h)
-        draw.rectangle([x, y, x + w, y + h], outline=(0, 230, 0), width=6)
-    except (TypeError, ValueError):
-        pass
-    return img
+    return {"image": image, "boxes": [crop_to_box(x, y, w, h)]}
 
 
 def take_snapshot(dims: Optional[Dict], t: float, x, y, w, h):
     if not dims:
-        return None, None, "⚠️ Load a video first."
+        return None, None, "⚠️ Load a video first.", gr.update()
     video = Path(dims["path"])
     snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
     grab_frame(video, float(t), snap)
-    overlaid = overlay_image(dims, str(snap), x, y, w, h)
-    return str(snap), overlaid, f"📸 Snapshot at {float(t):.1f}s"
+    x, y, w, h = snap_to_reel(x, y, w, h, dims["w"], dims["h"])
+    return str(snap), annot_value(str(snap), x, y, w, h), f"📸 Snapshot at {float(t):.1f}s — drag the green box to choose the region.", (x, y, w, h)
 
 
-def redraw_overlay(dims, snapshot_path, x, y, w, h):
-    return overlay_image(dims, snapshot_path, x, y, w, h)
+def on_draw(annot, dims, snapshot_path, crop_state):
+    """User drew/dragged the box on the canvas → snap to 9:16 and sync the numbers."""
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), crop_state)
+    if not dims or not annot or not annot.get("boxes"):
+        return noop
+    box = annot["boxes"][0]
+    x, y, w, h = box["xmin"], box["ymin"], box["xmax"] - box["xmin"], box["ymax"] - box["ymin"]
+    crop = snap_to_reel(x, y, w, h, dims["w"], dims["h"], drive="h")
+    if crop == crop_state:                       # already canonical → stop the echo
+        return noop
+    cx, cy, cw, ch = crop
+    return annot_value(snapshot_path, *crop), cx, cy, cw, ch, crop
+
+
+def on_numbers(x, y, w, h, dims, snapshot_path, crop_state):
+    """User edited a crop number → keep 9:16 and redraw the box."""
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), crop_state)
+    if not dims:
+        return noop
+    px, py, pw, ph = crop_state or (x, y, w, h)
+    drive = "w" if (int(w) != int(pw) and int(h) == int(ph)) else "h"
+    crop = snap_to_reel(x, y, w, h, dims["w"], dims["h"], drive=drive)
+    if crop == crop_state:
+        return noop
+    cx, cy, cw, ch = crop
+    box = annot_value(snapshot_path, *crop) if snapshot_path else gr.update()
+    return box, cx, cy, cw, ch, crop
 
 
 def _render_clip(video: Path, start: float, end: float, crop: str) -> Path:
@@ -419,21 +477,22 @@ def select_clip(dims, clips, evt: gr.SelectData):
     idx = evt.index
     if idx is None or idx < 0 or idx >= len(clips):
         return (None, idx, gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), None, "")
+                gr.update(), gr.update(), gr.update(), gr.update(), None, "", gr.update())
     c = clips[idx]
-    # Refresh the snapshot at the clip's start time with its crop overlay.
-    overlaid = None
+    # Refresh the snapshot at the clip's start time with its crop box.
+    annot = None
     snap_path = None
     if dims:
         snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
         grab_frame(Path(dims["path"]), c["start"], snap)
         snap_path = str(snap)
-        overlaid = overlay_image(dims, snap_path, c["x"], c["y"], c["w"], c["h"])
+        annot = annot_value(snap_path, c["x"], c["y"], c["w"], c["h"])
     return (
         c["video"], idx,
         c["start"], c["end"], c["x"], c["y"], c["w"], c["h"],
-        overlaid, snap_path,
+        annot, snap_path,
         f"▶️ Loaded clip #{idx + 1} into the control center.",
+        (c["x"], c["y"], c["w"], c["h"]),
     )
 
 
@@ -586,6 +645,7 @@ def build_app() -> gr.Blocks:
                         dims_state = gr.State(None)
                         snapshot_state = gr.State(None)
                         selected_state = gr.State(-1)
+                        crop_state = gr.State(None)
 
                         rc_video_file = gr.File(label="Video", file_types=["video", ".mp4", ".mov", ".mkv"])
                         rc_compile = gr.Button("🎬 Create reel", elem_id="create-reel-btn")
@@ -603,8 +663,11 @@ def build_app() -> gr.Blocks:
                                 rc_snap_time = gr.Slider(0, 1, value=0, step=0.5,
                                                          label="Snapshot time (s)")
                                 rc_snap_btn = gr.Button("📸 Take snapshot")
-                                rc_canvas = gr.Image(label="Region canvas (green = crop)",
-                                                     interactive=False, height=240)
+                                rc_annotator = image_annotator(
+                                    label="Drag the green box (locked to 9:16 reel shape)",
+                                    single_box=True, disable_edit_boxes=True, height=300,
+                                    show_download_button=False, show_share_button=False,
+                                )
                                 with gr.Row():
                                     rc_x = gr.Number(label="Crop X", value=0, precision=0)
                                     rc_y = gr.Number(label="Crop Y", value=0, precision=0)
@@ -634,16 +697,24 @@ def build_app() -> gr.Blocks:
                         rc_video_file.change(
                             load_reel_source, [rc_video_file],
                             [rc_video, dims_state, rc_snap_time, rc_end,
-                             rc_x, rc_y, rc_w, rc_h, rc_start, rc_status],
+                             rc_x, rc_y, rc_w, rc_h, rc_start, rc_status, crop_state],
                         )
                         rc_snap_btn.click(
                             take_snapshot, [dims_state, rc_snap_time, rc_x, rc_y, rc_w, rc_h],
-                            [snapshot_state, rc_canvas, rc_status],
+                            [snapshot_state, rc_annotator, rc_status, crop_state],
+                        )
+                        # Bidirectional crop editing: draw the box ↔ edit the numbers,
+                        # always re-snapped to 9:16 (crop_state guards against echo loops).
+                        crop_io = [rc_annotator, rc_x, rc_y, rc_w, rc_h, crop_state]
+                        rc_annotator.change(
+                            on_draw, [rc_annotator, dims_state, snapshot_state, crop_state], crop_io,
                         )
                         for ctrl in (rc_x, rc_y, rc_w, rc_h):
-                            ctrl.change(redraw_overlay,
-                                        [dims_state, snapshot_state, rc_x, rc_y, rc_w, rc_h],
-                                        [rc_canvas])
+                            ctrl.change(
+                                on_numbers,
+                                [rc_x, rc_y, rc_w, rc_h, dims_state, snapshot_state, crop_state],
+                                crop_io,
+                            )
                         rc_add.click(
                             add_clip,
                             [dims_state, clips_state, rc_start, rc_end, rc_x, rc_y, rc_w, rc_h],
@@ -662,7 +733,7 @@ def build_app() -> gr.Blocks:
                         rc_gallery.select(
                             select_clip, [dims_state, clips_state],
                             [rc_preview, selected_state, rc_start, rc_end,
-                             rc_x, rc_y, rc_w, rc_h, rc_canvas, snapshot_state, rc_status],
+                             rc_x, rc_y, rc_w, rc_h, rc_annotator, snapshot_state, rc_status, crop_state],
                         )
                         rc_compile.click(
                             compile_reel, [dims_state, clips_state, rc_reel_out],

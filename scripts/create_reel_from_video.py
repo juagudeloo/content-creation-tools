@@ -278,8 +278,19 @@ def format_reel(
     segments: List[Dict],
     crops: Dict[str, str],
     out_path: Path,
+    fade: float = 0.0,
 ) -> None:
-    """Crop and scale each segment to 1080×1920, then concatenate."""
+    """Crop and scale each segment to 1080×1920, then concatenate.
+
+    Cuts are frame-accurate: ``-ss`` does a fast input seek (accurate_seek is on
+    by default) and the duration is given with ``-t`` *after* ``-i``, so each
+    segment starts exactly at ``start`` and lasts exactly ``end - start``. This
+    keeps boundaries shared by contiguous segments seamless (no repeated/dropped
+    frames at the seam).
+
+    When ``fade > 0`` each segment fades from/to black (and audio ramps) over
+    ``min(fade, duration / 2)`` seconds at its head and tail.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -291,19 +302,34 @@ def format_reel(
                     f"Segment type '{crop_type}' is not defined in the crops section of the YAML."
                 )
             crop = crops[crop_type]
+            start = float(seg["start"])
+            end = float(seg["end"])
+            dur = max(end - start, 0.0)
+
+            video_filter = f"crop={crop},scale=1080:1920"
+            audio_filter = None
+            if fade and fade > 0 and dur > 0:
+                f = min(float(fade), dur / 2.0)
+                out_start = max(dur - f, 0.0)
+                video_filter += f",fade=t=in:st=0:d={f:.3f},fade=t=out:st={out_start:.3f}:d={f:.3f}"
+                audio_filter = f"afade=t=in:st=0:d={f:.3f},afade=t=out:st={out_start:.3f}:d={f:.3f}"
+
             part = td / f"part_{i}.mp4"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-ss", str(seg["start"]), "-to", str(seg["end"]),
-                    "-i", str(input_path),
-                    "-vf", f"crop={crop},scale=1080:1920",
-                    "-c:v", "libx264", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "192k",
-                    str(part),
-                ],
-                check=True,
-            )
+            command = [
+                "ffmpeg", "-y",
+                "-ss", f"{start:.6f}",
+                "-i", str(input_path),
+                "-t", f"{dur:.6f}",
+                "-vf", video_filter,
+            ]
+            if audio_filter:
+                command += ["-af", audio_filter]
+            command += [
+                "-c:v", "libx264", "-crf", "23",
+                "-c:a", "aac", "-b:a", "192k",
+                str(part),
+            ]
+            subprocess.run(command, check=True)
             parts.append(part)
 
         listfile = td / "files.txt"

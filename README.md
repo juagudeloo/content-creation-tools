@@ -56,10 +56,12 @@ result is shown in a player / download box.
 
 Tabs: **Generate subtitles**, **Burn subtitles** (with a live SRT editor — save
 with `Ctrl+S`), and **Create reel** with two modes — *Clip creation*
-(semantic keyword cut) and *Reel compilation* (snapshot a frame, **draw the crop
-box** right on it — locked to the 9:16 reel shape and synced with the numeric
-fields — pick time intervals, and compile the selected clips into one vertical
-reel).
+(semantic keyword cut) and *Reel compilation*, a razor/split-timeline mini
+editor: scrub a frame-accurate playhead, **✂️ Split** the source into
+contiguous sections, **draw the 9:16 crop box** per section, include/exclude
+sections, optionally add fade in/out, and compile into one vertical reel.
+Because sections share their boundaries and are cut frame-accurately, adjacent
+included sections join seamlessly (no repeated or overlapping words at the seam).
 
 > The app and scripts share one `.venv`, pinned to the gradio-4.44 era because
 > `gradio-path-selector` is a gradio 4.x component (see the note in

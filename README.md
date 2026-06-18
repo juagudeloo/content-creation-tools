@@ -41,6 +41,29 @@ This repository contains CLI scripts for transcribing, translating, and creating
    ```
    Output: `input-keyword or phrase-reel.burned.mp4`
 
+## Gradio app
+
+A single interface wrapping all of the above lives in [app.py](app.py). It
+bootstraps its own `.venv` (like the scripts) and installs `gradio`:
+
+```bash
+python3 app.py
+```
+
+Videos and subtitles are chosen with native **file pickers** (`gr.File`), output
+folders with an in-app **path browser** (`gradio-path-selector`), and every
+result is shown in a player / download box.
+
+Tabs: **Generate subtitles**, **Burn subtitles** (with a live SRT editor — save
+with `Ctrl+S`), and **Create reel** with two modes — *Clip creation*
+(semantic keyword cut) and *Reel compilation* (snapshot a region, pick time
+intervals, and compile the selected clips into one vertical reel).
+
+> The app and scripts share one `.venv`, pinned to the gradio-4.44 era because
+> `gradio-path-selector` is a gradio 4.x component (see the note in
+> [requirements.txt](requirements.txt)). It's all installed automatically on
+> first run.
+
 ## How to use it (basic)
 
 ```bash

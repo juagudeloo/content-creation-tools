@@ -686,8 +686,11 @@ def build_app() -> gr.Blocks:
                             with gr.Column(scale=1):
                                 gr.Markdown("### Session clips")
                                 rc_preview = gr.Video(label="Selected clip preview")
+                                # No fixed height: the gallery grows with the clips and the
+                                # page scrolls, so every clip stays reachable/clickable.
                                 rc_gallery = gr.Gallery(label="Carousel (click to load)",
-                                                        columns=3, height=240, allow_preview=False)
+                                                        columns=2, object_fit="cover",
+                                                        allow_preview=False)
 
                         rc_reel_out = with_folder_picker("Reel output folder (optional)",
                                                          "Leave empty to just download the result below")

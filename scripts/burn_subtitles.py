@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import argparse
-from scripts._utils import render_burned_video
+from _utils import render_burned_video
 
 
 def parse_args() -> argparse.Namespace:

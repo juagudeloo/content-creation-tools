@@ -1,16 +1,25 @@
-# create_reel_from_video.py — How to build a semantically-curated reel
+# create_reel_from_video.py — Two-stage reel pipeline
 
-`scripts/create_reel_from_video.py` assembles a short reel from an MP4 by finding the transcript sections whose *meaning* is most similar to a given topic. It uses `sentence-transformers` to embed both the query and each paragraph, ranks by cosine similarity, and cuts only the most relevant blocks. Everything runs locally — no API key, no internet connection beyond the one-time model download.
+`scripts/create_reel_from_video.py` is a two-stage tool. The stages are intentionally separate because crop coordinates and segment boundaries are video-specific and need a human review step before committing to a lossy re-encode.
 
-## Design rationale
+```
+Stage 1 — extract-clips   Find and cut the semantically relevant sections of a video.
+Stage 2 — apply-format    Convert those clips to 9:16 vertical format using a YAML layout spec.
+```
 
-Keyword matching requires the exact word to appear. Semantic embedding understands meaning: a query like "how the model avoids forgetting old knowledge" will surface sections that discuss catastrophic forgetting even if none of those exact words appear.
+---
 
-The default model (`paraphrase-multilingual-MiniLM-L12-v2`) is multilingual and understands Spanish, so it works correctly with Spanish-language source videos even when technical terms are in English. Auto-transcription keeps the original language (Spanish) rather than translating, so the embedding comparison operates on the same language the speaker used.
+## Stage 1: extract-clips
 
-## Step-by-step
+```bash
+python3 scripts/create_reel_from_video.py extract-clips <video.mp4> "<query>" [options]
+```
 
-1. **Bootstrap the venv**: checks `REEL_BOOTSTRAP_READY`, creates `.venv` if needed, installs `requirements.txt` (which includes `sentence-transformers`), then re-execs under the venv Python.
+Finds the transcript sections whose *meaning* is most similar to the query, cuts them from the source video, and writes one MP4 per detected occurrence of the topic.
+
+### How it works
+
+1. **Bootstrap the venv**: checks `REEL_BOOTSTRAP_READY`, creates `.venv` if needed, installs `requirements.txt` (which includes `sentence-transformers` and `pyyaml`), then re-execs under the venv Python.
 
 2. **Auto-transcribe if needed**: if `--sub-file` is not provided, calls `generate_english_subtitles.py` with `--task transcribe --language es`, producing `<video_stem>.es.srt` in the original Spanish. This preserves the speaker's exact phrasing for the embedding step.
 
@@ -18,65 +27,144 @@ The default model (`paraphrase-multilingual-MiniLM-L12-v2`) is multilingual and 
 
 4. **Group cues into topic paragraphs**: consecutive cues are merged as long as two conditions are both false:
    - the silence gap between cues exceeds `PARAGRAPH_GAP` (1.5 s) — topic shift signal
-   - the paragraph would exceed `MAX_PARAGRAPH_DURATION` (90 s) — safety cap
+   - the paragraph would exceed `MAX_PARAGRAPH_DURATION` (90 s) — safety cap for continuous speech
 
-   The duration cap is critical for videos with continuous speech and few pauses: without it, the entire video can collapse into 2–3 giant paragraphs, which dilutes the semantic signal and makes it impossible to distinguish topics from each other.
-
-5. **Embed and rank**: the query and all paragraph texts are encoded into vectors with the multilingual model running on CPU. Cosine similarity is computed between the query vector and each paragraph vector.
+5. **Embed and rank**: the query and all paragraph texts are encoded with the multilingual model on CPU. Cosine similarity is computed for each paragraph.
 
 6. **Select relevant paragraphs**: paragraphs with similarity ≥ `SIMILARITY_THRESHOLD` (0.25) are kept, ranked highest-score first. If nothing clears the threshold, the top-3 by score are used as a fallback.
 
 7. **Fill budget by relevance, then sort chronologically**: `trim_to_max_length` takes paragraphs from the highest-relevance end of the ranked list until the `--max-seconds` budget is filled. The kept segments are then re-sorted by start time so the reel plays in the original video order.
 
-   This order matters: picking by relevance first (not by earliest timestamp) ensures the most relevant section of the video ends up in the reel even if it appears after a less-relevant section that also cleared the threshold.
+8. **Cluster into separate reels**: segments more than `CLUSTER_GAP` (60 s) apart start a new cluster — and a new reel. This separates distinct occurrences of a topic (e.g. the initial explanation and the closing summary).
 
-8. **Cluster into separate reels**: the selected segments are sorted chronologically and grouped by proximity. Any gap larger than `CLUSTER_GAP` (60 s) between two relevant segments starts a new cluster — and a new reel. This separates distinct occurrences of a topic (e.g. the initial concept explanation and the closing summary) instead of merging them into one video. Each cluster is trimmed independently to `--max-seconds`.
+9. **Clip and concatenate with ffmpeg** (`-c copy`, no re-encode) once per cluster.
 
-9. **Clip and concatenate with ffmpeg** (once per cluster): each range is cut with `-c copy` (no re-encode) and joined via a concat list file.
+10. **Verification report per reel**: the script embeds the reel's transcript against the query and prints a relevance score and short preview.
 
-10. **Write outputs per reel**: if only one cluster is found, the original naming is used. Multiple clusters add a numeric suffix.
-    - `<stem>-<query>-reel.mp4` (single) or `<stem>-<query>-reel-1.mp4`, `-2.mp4`, … (multiple)
-    - Same pattern for `-script.txt` and `-en.srt`
+### Outputs per reel
 
-11. **Verification report per reel**: after each reel is created, the script embeds its full transcript against the original query and prints a relevance score and short preview. This lets you confirm each reel covers the right topic and compare which occurrence scored highest.
+- `<stem>-<query>-reel.mp4` (single reel) or `<stem>-<query>-reel-1.mp4`, `-2.mp4` … (multiple)
+- Same pattern for `-script.txt` and `-en.srt`
 
-## Commands
+### Options
 
-```bash
-# Without a pre-existing SRT (auto-transcribes in Spanish):
-python3 scripts/create_reel_from_video.py video.mp4 "cómo el modelo evita el olvido catastrófico"
+| Flag | Default | Description |
+|---|---|---|
+| `--sub-file` | — | Existing SRT to skip transcription. |
+| `--out` | next to input | Output path or directory. |
+| `--max-seconds` | 60 | Per-reel length cap. |
+| `--embed-model` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model. |
 
-# With an existing SRT (skips transcription):
-python3 scripts/create_reel_from_video.py video.mp4 "data augmentation" \
-    --sub-file video.en.srt
-
-# Custom output location, length cap, and embedding model:
-python3 scripts/create_reel_from_video.py video.mp4 "fine tuning on drone images" \
-    --sub-file video.en.srt --out /path/to/output/ --max-seconds 90 \
-    --embed-model paraphrase-multilingual-MiniLM-L12-v2
-```
-
-`--out` can be a file path or a directory. When it is a directory, the reel is placed inside it with the auto-generated name.
-
-## Tunable constants
+### Tunable constants
 
 | Constant | Default | Effect |
 |---|---|---|
-| `PARAGRAPH_GAP` | 1.5 s | Silence gap that signals a topic shift between cues. |
-| `MAX_PARAGRAPH_DURATION` | 90 s | Hard cap on paragraph length. Prevents continuous speech from collapsing into a single giant paragraph. Lower this if topics are short; raise it if you want broader context per segment. |
-| `SIMILARITY_THRESHOLD` | 0.25 | Minimum cosine similarity to include a paragraph. Lower to include more sections; raise to be stricter. |
-| `CLUSTER_GAP` | 60 s | Gap between relevant segments that starts a new reel. Raise if the same topic recurs quickly; lower if you want tighter separation. |
-| `MAX_REEL_SECONDS` | 60 s | Default `--max-seconds` value. Applied per reel, not total. |
+| `PARAGRAPH_GAP` | 1.5 s | Silence gap that signals a topic shift. |
+| `MAX_PARAGRAPH_DURATION` | 90 s | Hard cap on paragraph length. Lower for finer topic separation. |
+| `SIMILARITY_THRESHOLD` | 0.25 | Minimum cosine similarity to include a paragraph. |
+| `CLUSTER_GAP` | 60 s | Gap that starts a new reel. |
+| `MAX_REEL_SECONDS` | 60 s | Default `--max-seconds`. Applied per reel, not total. |
+
+### Examples
+
+```bash
+# Auto-transcribe and search (Spanish video):
+python3 scripts/create_reel_from_video.py extract-clips video.mp4 "cómo el modelo evita el olvido catastrófico"
+
+# With an existing SRT (skips transcription):
+python3 scripts/create_reel_from_video.py extract-clips video.mp4 "data augmentation" \
+    --sub-file video.es.srt
+
+# Custom output location and length:
+python3 scripts/create_reel_from_video.py extract-clips video.mp4 "fine tuning" \
+    --out /path/to/output/ --max-seconds 90
+```
+
+---
+
+## Stage 2: apply-format
+
+```bash
+python3 scripts/create_reel_from_video.py apply-format <format.yaml> [--out-dir DIR]
+```
+
+Takes the reel files produced by `extract-clips` and converts each one to 1080×1920 (9:16) vertical format. You specify which time ranges should use a face crop vs. a screen crop.
+
+### YAML format
+
+```yaml
+# Crop regions in the SOURCE video (w:h:x:y — ffmpeg crop filter syntax).
+# For a 1920×1080 source: a ~607:1080 width gives a 9:16 aspect ratio.
+crops:
+  face:   "607:1080:1313:0"   # ADJUST: x offset where your webcam appears
+  screen: "607:1080:0:0"      # ADJUST: x offset where the code/screen is
+
+videos:
+  video-data-augmentation-reel-1.mp4:
+    segments:
+      - {start: 0,  end: 18, type: face}
+      - {start: 18, end: 50, type: screen}
+      - {start: 50, end: 60, type: face}
+
+  video-data-augmentation-reel-2.mp4:
+    crops:                           # per-video override (merged with global crops)
+      face: "607:1080:1000:0"
+    output: summary-reel-formatted.mp4   # optional custom output name
+    segments:
+      - {start: 0, end: 60, type: screen}
+```
+
+**Key points:**
+
+- `crops` at the top level are document-wide defaults.
+- Each video entry can add its own `crops` block to override specific keys for that video.
+- `output` is optional — defaults to `<stem>-formatted.mp4` next to the input, or inside `--out-dir`.
+- Segment `start`/`end` are **seconds relative to the reel file** (i.e. 0-based after `extract-clips` has cut the clip).
+- Each segment is re-encoded with `libx264 CRF 23 + AAC 192k`, then segments are concatenated without re-encoding.
+
+### Finding your crop coordinates
+
+The crop value `"w:h:x:y"` defines a rectangle in the source video:
+
+- `w` and `h` — width and height of the region to keep
+- `x` and `y` — top-left corner offset
+
+For a 1920×1080 source and 9:16 output: keep `h=1080` and set `w=607` (1080×9/16 ≈ 607). Then adjust `x` to center on the area of interest. A 9:16 crop starting at the far right is `607:1080:1313:0`; starting at the far left is `607:1080:0:0`.
+
+Use `ffprobe` or a video player with coordinate display to identify where your face and screen appear in the frame.
+
+### Example
+
+```bash
+# After extract-clips has produced reel-1.mp4 and reel-2.mp4:
+python3 scripts/create_reel_from_video.py apply-format format.yaml
+
+# Place all formatted videos in a dedicated folder:
+python3 scripts/create_reel_from_video.py apply-format format.yaml --out-dir /path/to/formatted/
+```
+
+### Verify output dimensions
+
+```bash
+ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height -of csv=p=0 \
+    video-data-augmentation-reel-1-formatted.mp4
+# expected: 1080,1920
+```
+
+---
 
 ## Requirements
 
 - `ffmpeg` must be on `PATH`.
-- `sentence-transformers` is installed automatically into `.venv` on first run. The default multilingual model is ~120 MB and is downloaded once from HuggingFace on first use.
-- PyTorch (pulled in by `sentence-transformers`) will attempt to use CUDA. If your GPU is not compatible with the installed PyTorch build, the script forces CPU via `device="cpu"` on the `SentenceTransformer` constructor — no manual action needed.
+- `sentence-transformers` and `pyyaml` are installed automatically into `.venv` on first run.
+- The default multilingual embedding model (~120 MB) is downloaded once from HuggingFace on first use.
+- If your GPU is not compatible with the installed PyTorch build, the script forces CPU — no manual action needed.
 
 ## Troubleshooting
 
-- **Wrong topic in the reel**: check the verification score. If it is below 0.25, rephrase the query. If the score is moderate but the content is wrong, lower `MAX_PARAGRAPH_DURATION` so topics are more finely separated.
-- **No segments found**: the query may be too specific or in a language the model isn't handling well. Try a shorter phrase or a multilingual model.
-- **Reel cuts off mid-sentence**: the matched paragraph ended there. Increase `PARAGRAPH_GAP` to absorb longer pauses within the same topic.
-- **ffmpeg concat warnings about non-monotonic DTS**: these are cosmetic. They appear when two clips from different positions in the source video are joined with `-c copy`. The output plays correctly.
+- **Wrong topic in the reel**: check the verification score printed after `extract-clips`. If below 0.25, rephrase the query. If moderate but wrong content, lower `MAX_PARAGRAPH_DURATION`.
+- **No segments found**: the query may be too specific. Try a shorter phrase.
+- **Reel cuts off mid-sentence**: increase `PARAGRAPH_GAP` to absorb longer pauses within the same topic.
+- **`apply-format` crops the wrong area**: adjust the `x` offset in the crop string. Use a video player to find the pixel coordinates of your face or screen region.
+- **ffmpeg concat warnings about non-monotonic DTS**: cosmetic, output plays correctly.

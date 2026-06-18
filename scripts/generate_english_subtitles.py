@@ -14,8 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import faster_whisper
-from scripts._utils import escape_path_for_ffmpeg, render_burned_video
+from _utils import escape_path_for_ffmpeg, render_burned_video
 
 
 DEFAULT_MODEL = "small"
@@ -163,6 +162,8 @@ def resolve_device(device: str) -> str:
 
 
 def load_whisper_model(model_name: str, device: str, compute_type: str):
+    import faster_whisper
+
     preferred_compute_types = ["float16" if device == "cuda" else "float32", "int8_float16", "int8"]
     if compute_type != "auto":
         preferred_compute_types.append(compute_type)

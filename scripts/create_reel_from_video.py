@@ -9,7 +9,7 @@ import sys
 import tempfile
 import venv
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 MAX_REEL_SECONDS = 60
 PARAGRAPH_GAP = 1.5          # silence gap (seconds) that signals a new topic block
@@ -31,7 +31,7 @@ def ensure_virtual_environment() -> None:
         builder = venv.EnvBuilder(with_pip=True)
         builder.create(VENV_DIR)
     check = subprocess.run(
-        [str(venv_python), "-c", "import sentence_transformers"],
+        [str(venv_python), "-c", "import sentence_transformers, yaml"],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if check.returncode != 0:
@@ -44,22 +44,46 @@ def ensure_virtual_environment() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a short reel by finding the transcript sections most semantically relevant to a topic."
+        description="Two-stage reel pipeline: extract relevant clips then apply vertical formatting."
     )
-    parser.add_argument("input_video", type=Path, help="Input video file (MP4)")
-    parser.add_argument("query", type=str, help="Topic or sentence describing what you want the reel to cover")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # ── extract-clips ──────────────────────────────────────────────────────────
+    clips = subparsers.add_parser(
+        "extract-clips",
+        help="Find and cut the segments most semantically relevant to a topic query.",
+    )
+    clips.add_argument("input_video", type=Path, help="Input video file (MP4)")
+    clips.add_argument("query", type=str, help="Topic or sentence describing what you want the reel to cover")
+    clips.add_argument(
         "--sub-file", type=Path,
         help="Existing SRT to use as the transcription source. If absent, transcribes the video in its original language.",
     )
-    parser.add_argument("--out", type=Path, help="Output path or directory for the reel. Defaults to next to the input video.")
-    parser.add_argument("--max-seconds", type=int, default=MAX_REEL_SECONDS, help="Maximum reel length in seconds (default 60)")
-    parser.add_argument(
+    clips.add_argument("--out", type=Path, help="Output path or directory for the reel. Defaults to next to the input video.")
+    clips.add_argument("--max-seconds", type=int, default=MAX_REEL_SECONDS, help="Maximum reel length in seconds (default 60)")
+    clips.add_argument(
         "--embed-model", default="paraphrase-multilingual-MiniLM-L12-v2",
         help="Sentence-transformers model for semantic matching. Default is multilingual.",
     )
+
+    # ── apply-format ───────────────────────────────────────────────────────────
+    fmt = subparsers.add_parser(
+        "apply-format",
+        help="Convert extracted reels to vertical 9:16 format using a YAML layout spec.",
+    )
+    fmt.add_argument(
+        "format_yaml", type=Path,
+        help="YAML file describing crop regions and time segments per video.",
+    )
+    fmt.add_argument(
+        "--out-dir", type=Path,
+        help="Output directory for formatted videos. Defaults to same directory as each input video.",
+    )
+
     return parser.parse_args()
 
+
+# ── Shared helpers (used by extract-clips) ────────────────────────────────────
 
 def generate_srt(input_video: Path) -> Path:
     """Transcribe in the original language (no translation) to preserve meaning for embedding."""
@@ -128,7 +152,7 @@ def load_embed_model(embed_model: str):
 def find_relevant_segments(
     paragraphs: List[Tuple[float, float, str]],
     query: str,
-    model,
+    model: Any,
 ) -> List[Tuple[float, float]]:
     """Return (start, end) pairs sorted by relevance score descending.
 
@@ -144,7 +168,6 @@ def find_relevant_segments(
 
     scored = sorted(zip(scores, paragraphs), key=lambda x: x[0], reverse=True)
 
-    # Keep paragraphs above threshold, ranked by score (highest first)
     selected = [(s, e) for score, (s, e, _) in scored if score >= SIMILARITY_THRESHOLD]
     if not selected:
         selected = [(s, e) for _, (s, e, _) in scored[:3]]
@@ -155,7 +178,7 @@ def find_relevant_segments(
 def verify_reel(
     reel_entries: List[Tuple[float, float, str]],
     query: str,
-    model,
+    model: Any,
 ) -> None:
     from sentence_transformers import util  # type: ignore
 
@@ -248,9 +271,53 @@ def write_reel_srt(entries: List[Tuple[float, float, str]], out_srt: Path) -> No
     out_srt.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def main() -> None:
-    ensure_virtual_environment()
-    args = parse_args()
+# ── apply-format helpers ──────────────────────────────────────────────────────
+
+def format_reel(
+    input_path: Path,
+    segments: List[Dict],
+    crops: Dict[str, str],
+    out_path: Path,
+) -> None:
+    """Crop and scale each segment to 1080×1920, then concatenate."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        parts = []
+        for i, seg in enumerate(segments):
+            crop_type = seg["type"]
+            if crop_type not in crops:
+                raise SystemExit(
+                    f"Segment type '{crop_type}' is not defined in the crops section of the YAML."
+                )
+            crop = crops[crop_type]
+            part = td / f"part_{i}.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", str(seg["start"]), "-to", str(seg["end"]),
+                    "-i", str(input_path),
+                    "-vf", f"crop={crop},scale=1080:1920",
+                    "-c:v", "libx264", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "192k",
+                    str(part),
+                ],
+                check=True,
+            )
+            parts.append(part)
+
+        listfile = td / "files.txt"
+        listfile.write_text("\n".join(f"file '{p.as_posix()}'" for p in parts))
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", str(out_path)],
+            check=True,
+        )
+    print(f"Formatted reel: {out_path}")
+
+
+# ── Subcommand entrypoints ────────────────────────────────────────────────────
+
+def run_extract_clips(args: argparse.Namespace) -> None:
     input_video = args.input_video.resolve()
     safe_query = re.sub(r"[^\w\s-]", "", args.query).strip().replace(" ", "-")[:40]
     default_name = f"{input_video.stem}-{safe_query}-reel.mp4"
@@ -277,15 +344,10 @@ def main() -> None:
     if not hits:
         raise SystemExit("No relevant segments found for that query.")
 
-    # Group relevant segments by proximity: each cluster = one occurrence of the topic.
-    # Segments more than CLUSTER_GAP seconds apart become separate reels so that
-    # distinct mentions (e.g. initial explanation vs. closing summary) are not mixed.
     clusters = cluster_segments(sorted(hits))
     print(f"Found {len(clusters)} relevant section(s) → creating {len(clusters)} reel(s).")
 
     for i, cluster in enumerate(clusters, start=1):
-        # Derive output paths: no suffix when there is only one reel (backward-compatible),
-        # numeric suffix otherwise.
         if len(clusters) == 1:
             reel_out = out
         else:
@@ -310,6 +372,52 @@ def main() -> None:
         label = f"Reel {i}/{len(clusters)}" if len(clusters) > 1 else "Reel"
         print(f"\n{label}: {reel_out}\nScript: {script_out}\nSRT: {srt_out}")
         verify_reel(reel_entries, args.query, embed_model)
+
+
+def run_apply_format(args: argparse.Namespace) -> None:
+    import yaml  # type: ignore
+
+    spec = yaml.safe_load(args.format_yaml.read_text(encoding="utf-8"))
+    global_crops: Dict[str, str] = spec.get("crops", {})
+    base_dir = args.format_yaml.resolve().parent
+
+    videos = spec.get("videos", {})
+    if not videos:
+        raise SystemExit("YAML file has no 'videos' section.")
+
+    for filename, video_spec in videos.items():
+        input_path = Path(filename)
+        if not input_path.is_absolute():
+            input_path = base_dir / input_path
+
+        crops = {**global_crops, **video_spec.get("crops", {})}
+        segments = video_spec.get("segments", [])
+        if not segments:
+            print(f"Warning: no segments defined for {filename}, skipping.")
+            continue
+
+        if "output" in video_spec:
+            out_path = Path(video_spec["output"])
+            if not out_path.is_absolute():
+                out_path = base_dir / out_path
+        elif args.out_dir:
+            out_path = args.out_dir.resolve() / f"{input_path.stem}-formatted.mp4"
+        else:
+            out_path = input_path.with_name(f"{input_path.stem}-formatted.mp4")
+
+        print(f"\nFormatting {input_path.name} → {out_path.name}  ({len(segments)} segment(s))")
+        format_reel(input_path, segments, crops, out_path)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ensure_virtual_environment()
+    args = parse_args()
+    if args.command == "extract-clips":
+        run_extract_clips(args)
+    elif args.command == "apply-format":
+        run_apply_format(args)
 
 
 if __name__ == "__main__":

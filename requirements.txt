@@ -1,5 +1,6 @@
 faster-whisper>=1.1.0
 sentence-transformers>=3.0.0
+pyyaml>=6.0
 
 # Optional (local-only) model and embedding libraries. Install only if you plan to run local LLMs or embeddings.
 # Examples:

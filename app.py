@@ -372,11 +372,13 @@ def annot_value(image: Optional[str], x, y, w, h):
     return {"image": image, "boxes": [crop_to_box(x, y, w, h)]}
 
 
-# ── Razor/split timeline — sections model ─────────────────────────────────────
-# A "section" is a contiguous, boundary-sharing slice of the source video:
-#   {"start": float, "end": float, "crop": "w:h:x:y", "include": bool, "thumb": path}
-# Sections always partition [0, duration] with shared boundaries, so two adjacent
-# *included* sections concatenate as an exact continuation (no overlap/repeat).
+# ── Independent clips model ───────────────────────────────────────────────────
+# A "clip" is rendered immediately when created/updated:
+#   {"start": float, "end": float, "x": int, "y": int, "w": int, "h": int,
+#    "crop": "w:h:x:y", "video": path, "thumb": path}
+# Clips are independent (not required to share boundaries). Frame-accurate
+# marking (below) plus frame-accurate ffmpeg cuts (format_reel) is what keeps
+# adjacent clips seamless if you mark their shared edge at the same time.
 
 def _frame_snap(dims, t: float) -> float:
     """Clamp t to [0, duration] and round to the nearest frame boundary."""
@@ -385,130 +387,108 @@ def _frame_snap(dims, t: float) -> float:
     return round(t * fps) / fps
 
 
-def _section_at(sections: List[Dict], t: float) -> int:
-    for i, s in enumerate(sections):
-        if s["start"] <= t < s["end"]:
-            return i
-    return len(sections) - 1 if sections else -1
+def _mark_button_label(prefix: str, value: Optional[float]) -> str:
+    return f"{prefix}: {value:.2f}s" if value is not None else f"{prefix}: not set"
 
 
-def _render_section_thumb(video: Path, sec: Dict) -> str:
-    t = (sec["start"] + sec["end"]) / 2.0
-    thumb = WORK_DIR / f"sect_{uuid.uuid4().hex}.png"
-    grab_frame(video, t, thumb)
+def _gallery_items(clips: List[Dict]) -> List[Tuple[str, str]]:
+    return [(c["thumb"], f"#{i + 1}  {c['start']:.2f}-{c['end']:.2f}s") for i, c in enumerate(clips)]
+
+
+def _render_clip(video: Path, start: float, end: float, crop: str) -> Path:
+    out = WORK_DIR / f"clip_{uuid.uuid4().hex}.mp4"
+    seg = {"start": float(start), "end": float(end), "type": "c"}
+    reel.format_reel(video, [seg], {"c": crop}, out)
+    return out
+
+
+def _render_clip_thumb(clip_path: Path) -> str:
+    thumb = WORK_DIR / f"thumb_{uuid.uuid4().hex}.png"
+    grab_frame(clip_path, 0.1, thumb)
     return str(thumb)
 
 
-def _gallery_items(sections: List[Dict]) -> List[Tuple[str, str]]:
-    items = []
-    for i, s in enumerate(sections):
-        mark = "✅" if s.get("include", True) else "🚫"
-        items.append((s["thumb"], f"{mark} #{i + 1}  {s['start']:.1f}–{s['end']:.1f}s"))
-    return items
-
-
-def _render_section_preview(dims: Dict, sec: Dict) -> str:
-    out = WORK_DIR / f"prev_{uuid.uuid4().hex}.mp4"
-    seg = {"start": sec["start"], "end": sec["end"], "type": "c"}
-    reel.format_reel(Path(dims["path"]), [seg], {"c": sec["crop"]}, out)
-    return str(out)
-
-
-def _crop_tuple(crop: str) -> Tuple[int, int, int, int]:
-    """Parse a "w:h:x:y" crop string into (x, y, w, h)."""
-    cw, ch, cx, cy = (int(v) for v in crop.split(":"))
-    return cx, cy, cw, ch
-
-
 def load_reel_source(video_path: str):
+    blank_marks = {"start": None, "end": None, "target": "start"}
+    blank_start_btn = gr.update(value=_mark_button_label("▶ Start", None), variant="primary")
+    blank_end_btn = gr.update(value=_mark_button_label("⏹ End", None), variant="secondary")
     if not video_path:
         return (None, None, gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(), gr.update(), [], [], None, None, None,
-                "Upload a video to begin.", None, -1, 0.0, gr.update())
+                "Upload a video to begin.", None, -1, 0.0,
+                blank_marks, blank_start_btn, blank_end_btn)
     video = _clean_path(video_path)
     if video is None or not video.exists():
         return (None, None, gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(), gr.update(), [], [], None, None, None,
-                f"❌ Video not found: {video_path}", None, -1, 0.0, gr.update())
+                f"❌ Video not found: {video_path}", None, -1, 0.0,
+                blank_marks, blank_start_btn, blank_end_btn)
     video = video.resolve()
     src_w, src_h = video_dimensions(video)
     duration = video_duration(video)
     fps = video_fps(video)
     x, y, w, h = default_crop(src_w, src_h)
-    crop = f"{w}:{h}:{x}:{y}"
     dims = {"w": src_w, "h": src_h, "duration": duration, "path": str(video),
             "fps": fps, "frame_step": 1.0 / fps}
     snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
     grab_frame(video, 0.0, snap)
-    section = {"start": 0.0, "end": duration, "crop": crop, "include": True, "thumb": ""}
-    section["thumb"] = _render_section_thumb(video, section)
-    sections = [section]
     status = (f"✅ Loaded {video.name} — {src_w}×{src_h}, {duration:.1f}s, {fps:.2f}fps. "
-              "Scrub the playhead and press ✂️ Split to chop sections.")
+              "Mark a start and end, then press ➕ Add clip.")
     return (
         str(video), dims,
         gr.update(maximum=max(duration, 1), step=round(1.0 / fps, 4), value=0),  # rc_playhead
         gr.update(value=0.0),                                  # rc_time
         x, y, w, h,                                            # rc_x/y/w/h
-        sections, _gallery_items(sections),                    # sections_state, rc_gallery
+        [], [],                                                # clips_state, rc_gallery
         annot_value(str(snap), x, y, w, h),                    # rc_annotator
         str(snap),                                             # snapshot_state
         None,                                                  # rc_preview
         status,                                                # rc_status
         (x, y, w, h),                                          # crop_state
-        0,                                                     # selected_state
+        -1,                                                    # selected_state
         0.0,                                                   # playhead_state
-        gr.update(value=True),                                 # rc_include
+        blank_marks, blank_start_btn, blank_end_btn,           # marks_state, rc_mark_start/end
     )
 
 
 # ── Playhead scrubbing (frame preview only on release / step buttons) ──────────
+# The crop box shown while scrubbing is just "the current working crop"
+# (crop_state) — independent of any clip, exactly like the X/Y/W/H number
+# fields. It only gets captured into a clip when you press Add/Update.
 
-def _frame_at(dims, sections, sel_idx, t) -> Tuple[str, dict, Tuple[int, int, int, int]]:
-    """Render the frame at t and return it as an annotator value carrying the
-    selected section's crop box (or the default crop if no section is selected)."""
+def _frame_at(dims, crop_state, t) -> Tuple[str, dict, Tuple[int, int, int, int]]:
     snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
     grab_frame(Path(dims["path"]), float(t), snap)
-    if sections and 0 <= sel_idx < len(sections):
-        cx, cy, cw, ch = _crop_tuple(sections[sel_idx]["crop"])
+    if crop_state:
+        cx, cy, cw, ch = crop_state
     else:
         cx, cy, cw, ch = default_crop(dims["w"], dims["h"])
     return str(snap), annot_value(str(snap), cx, cy, cw, ch), (cx, cy, cw, ch)
 
 
-def render_playhead(dims, sections, sel_idx, t):
+def render_playhead(dims, crop_state, t):
     if not dims:
         return (gr.update(),) * 10
     t = _frame_snap(dims, t)
-    snap, annot, (cx, cy, cw, ch) = _frame_at(dims, sections, sel_idx, t)
+    snap, annot, (cx, cy, cw, ch) = _frame_at(dims, crop_state, t)
     return (snap, annot, cx, cy, cw, ch, (cx, cy, cw, ch), t,
             gr.update(value=round(t, 3)), gr.update(value=t))
 
 
-def step_frame(dims, sections, sel_idx, t, n_frames):
+def step_frame(dims, crop_state, t, n_frames):
     fs = dims["frame_step"] if dims else 1.0 / 30
-    return render_playhead(dims, sections, sel_idx, float(t) + n_frames * fs)
+    return render_playhead(dims, crop_state, float(t) + n_frames * fs)
 
 
-def step_seconds(dims, sections, sel_idx, t, secs):
-    return render_playhead(dims, sections, sel_idx, float(t) + secs)
+def step_seconds(dims, crop_state, t, secs):
+    return render_playhead(dims, crop_state, float(t) + secs)
 
 
-# ── Crop editing — retargeted to write into the selected section ───────────────
+# ── Crop editing (draw ↔ numbers), independent of any clip ────────────────────
 
-def _write_crop_to_section(sections, sel_idx, x, y, w, h):
-    if 0 <= sel_idx < len(sections):
-        sections = list(sections)
-        sections[sel_idx] = {**sections[sel_idx], "crop": f"{int(w)}:{int(h)}:{int(x)}:{int(y)}"}
-        return sections, _gallery_items(sections)
-    return sections, gr.update()
-
-
-def on_draw(annot, dims, snapshot_path, crop_state, sections, sel_idx):
-    """User drew/dragged the box → snap to 9:16, sync numbers, store on section."""
-    sections = list(sections or [])
-    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-            crop_state, sections, gr.update())
+def on_draw(annot, dims, snapshot_path, crop_state):
+    """User drew/dragged the box → snap to 9:16 and sync the numbers."""
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), crop_state)
     if not dims or not annot or not annot.get("boxes"):
         return noop
     box = annot["boxes"][0]
@@ -517,15 +497,12 @@ def on_draw(annot, dims, snapshot_path, crop_state, sections, sel_idx):
     if crop == crop_state:                       # already canonical → stop the echo
         return noop
     cx, cy, cw, ch = crop
-    sections, gallery = _write_crop_to_section(sections, sel_idx, cx, cy, cw, ch)
-    return annot_value(snapshot_path, *crop), cx, cy, cw, ch, crop, sections, gallery
+    return annot_value(snapshot_path, *crop), cx, cy, cw, ch, crop
 
 
-def on_numbers(x, y, w, h, dims, snapshot_path, crop_state, sections, sel_idx):
-    """User edited a crop number → keep 9:16, redraw box, store on section."""
-    sections = list(sections or [])
-    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-            crop_state, sections, gr.update())
+def on_numbers(x, y, w, h, dims, snapshot_path, crop_state):
+    """User edited a crop number → keep 9:16 and redraw the box."""
+    noop = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), crop_state)
     if not dims:
         return noop
     px, py, pw, ph = crop_state or (x, y, w, h)
@@ -535,108 +512,145 @@ def on_numbers(x, y, w, h, dims, snapshot_path, crop_state, sections, sel_idx):
         return noop
     cx, cy, cw, ch = crop
     box = annot_value(snapshot_path, *crop) if snapshot_path else gr.update()
-    sections, gallery = _write_crop_to_section(sections, sel_idx, cx, cy, cw, ch)
-    return box, cx, cy, cw, ch, crop, sections, gallery
+    return box, cx, cy, cw, ch, crop
 
 
-# ── Razor split / merge / select / include ─────────────────────────────────────
+# ── Start/End marking + clip add / update / delete / select ───────────────────
 
-def split_section(dims, sections, sel_idx, t):
-    """Split the section containing the playhead into [start, t] and [t, end]."""
-    sections = list(sections or [])
-    if not dims or not sections:
-        return sections, _gallery_items(sections), "⚠️ Load a video first.", sel_idx, None
+def set_mark_target(marks, target):
+    """Clicking the Start/End square doesn't change its value — it just tells the
+    next 'Split at playhead' press which one to (over)write."""
+    marks = dict(marks or {"start": None, "end": None, "target": "start"})
+    marks["target"] = target
+    return (
+        marks,
+        gr.update(value=_mark_button_label("▶ Start", marks.get("start")),
+                  variant="primary" if target == "start" else "secondary"),
+        gr.update(value=_mark_button_label("⏹ End", marks.get("end")),
+                  variant="primary" if target == "end" else "secondary"),
+    )
+
+
+def mark_at_playhead(dims, marks, t):
+    """'Split at playhead' is pure bookkeeping: it only records the playhead time
+    into whichever mark (Start/End) is currently active. It never touches the
+    clip list and never renders anything — press ➕ Add clip for that.
+    - 1st press (target=='start') records where the next clip begins.
+    - 2nd press (target=='end') records where it ends.
+    Click the Start or End square (set_mark_target) first to redo just that one
+    mark before adding/updating a clip.
+    """
+    marks = dict(marks or {"start": None, "end": None, "target": "start"})
+
+    def buttons():
+        return (gr.update(value=_mark_button_label("▶ Start", marks.get("start")),
+                          variant="primary" if marks.get("target") == "start" else "secondary"),
+                gr.update(value=_mark_button_label("⏹ End", marks.get("end")),
+                          variant="primary" if marks.get("target") == "end" else "secondary"))
+
+    if not dims:
+        start_btn, end_btn = buttons()
+        return marks, start_btn, end_btn, "⚠️ Load a video first."
+
     t = _frame_snap(dims, t)
-    i = _section_at(sections, t)
-    s = sections[i]
-    eps = dims["frame_step"]
-    if not (s["start"] + eps <= t <= s["end"] - eps):
-        return (sections, _gallery_items(sections),
-                "⚠️ Playhead is on a section boundary — move it inside a section to split.",
-                sel_idx, None)
-    video = Path(dims["path"])
-    left = {"start": s["start"], "end": t, "crop": s["crop"], "include": s["include"], "thumb": ""}
-    right = {"start": t, "end": s["end"], "crop": s["crop"], "include": s["include"], "thumb": ""}
-    left["thumb"] = _render_section_thumb(video, left)
-    right["thumb"] = _render_section_thumb(video, right)
-    sections[i:i + 1] = [left, right]
-    return (sections, _gallery_items(sections),
-            f"✂️ Split at {t:.2f}s — {len(sections)} sections.", i + 1, None)
+    target = marks.get("target", "start")
+    marks[target] = t
 
-
-def merge_section(dims, sections, sel_idx):
-    """Join the selected section with the next one (or the previous one if it is
-    the last), keeping the left section's crop and include flag."""
-    sections = list(sections or [])
-    if not dims or not sections or sel_idx is None or sel_idx < 0:
-        return sections, _gallery_items(sections), "⚠️ Select a section to merge.", sel_idx, None
-    if len(sections) == 1:
-        return sections, _gallery_items(sections), "⚠️ Only one section — nothing to merge.", 0, None
-    left = sel_idx if sel_idx < len(sections) - 1 else sel_idx - 1
-    a, b = sections[left], sections[left + 1]
-    merged = {"start": a["start"], "end": b["end"], "crop": a["crop"],
-              "include": a["include"], "thumb": ""}
-    merged["thumb"] = _render_section_thumb(Path(dims["path"]), merged)
-    sections[left:left + 2] = [merged]
-    return (sections, _gallery_items(sections),
-            f"🔗 Merged — {len(sections)} sections.", left, None)
-
-
-def select_section(dims, sections, evt: gr.SelectData):
-    """Load the clicked section into the editor: crop box, numbers, playhead,
-    include checkbox, and a cropped preview."""
-    sections = list(sections or [])
-    idx = evt.index
-    if not dims or idx is None or not (0 <= idx < len(sections)):
-        return (gr.update(),) * 14
-    s = sections[idx]
-    cx, cy, cw, ch = _crop_tuple(s["crop"])
-    t = s["start"]
-    snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
-    grab_frame(Path(dims["path"]), t, snap)
-    annot = annot_value(str(snap), cx, cy, cw, ch)
-    try:
-        preview = _render_section_preview(dims, s)
-    except subprocess.CalledProcessError:
-        preview = None
-    return (idx, cx, cy, cw, ch, annot, str(snap), (cx, cy, cw, ch),
-            gr.update(value=t), gr.update(value=round(t, 3)), t,
-            gr.update(value=s["include"]), preview,
-            f"▶️ Section #{idx + 1} selected ({s['start']:.1f}–{s['end']:.1f}s).")
-
-
-def toggle_include(sections, sel_idx, value):
-    sections = list(sections or [])
-    if sel_idx is None or not (0 <= sel_idx < len(sections)):
-        return sections, _gallery_items(sections), "⚠️ Select a section first."
-    sections[sel_idx] = {**sections[sel_idx], "include": bool(value)}
-    n_inc = sum(1 for s in sections if s["include"])
-    verb = "✅ Included" if value else "🚫 Excluded"
-    return sections, _gallery_items(sections), f"{verb} section #{sel_idx + 1} ({n_inc} in reel)."
-
-
-def delete_section(sections, sel_idx):
-    """Remove the selected section entirely. Remaining sections keep their own
-    ranges (the deleted span is simply dropped from the reel)."""
-    sections = list(sections or [])
-    if sel_idx is None or not (0 <= sel_idx < len(sections)):
-        return (sections, _gallery_items(sections),
-                "⚠️ Click a section below to select it, then delete.", -1, None)
-    removed = sections.pop(sel_idx)
-    if sections:
-        msg = f"🗑️ Deleted section {removed['start']:.1f}–{removed['end']:.1f}s — {len(sections)} left."
+    if target == "start":
+        marks["target"] = "end"
+        status = f"🟢 Start marked at {t:.2f}s — move the playhead and press ✂️ Split again to mark the end."
     else:
-        msg = "🗑️ Deleted the last section — upload a video to start over."
-    return sections, _gallery_items(sections), msg, -1, None
+        status = f"🔴 End marked at {t:.2f}s — press ➕ Add clip (or ✏️ Update selected)."
+
+    start_btn, end_btn = buttons()
+    return marks, start_btn, end_btn, status
 
 
-def compile_reel(dims, sections, fade, output_path):
-    sections = list(sections or [])
+def create_clip(dims, clips, marks, x, y, w, h):
+    clips = list(clips or [])
+    marks = marks or {}
+    if not dims:
+        return clips, _gallery_items(clips), None, "⚠️ Load a video first.", -1
+    start, end = marks.get("start"), marks.get("end")
+    if start is None or end is None:
+        return clips, _gallery_items(clips), None, "⚠️ Mark both a start and an end time first.", -1
+    if end <= start:
+        return clips, _gallery_items(clips), None, "❌ End must be after start.", -1
+    video = Path(dims["path"])
+    crop = f"{int(w)}:{int(h)}:{int(x)}:{int(y)}"
+    try:
+        clip_path = _render_clip(video, start, end, crop)
+    except subprocess.CalledProcessError as exc:
+        return clips, _gallery_items(clips), None, f"❌ ffmpeg failed: {exc}", -1
+    thumb = _render_clip_thumb(clip_path)
+    clips.append({"start": start, "end": end, "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+                  "crop": crop, "video": str(clip_path), "thumb": thumb})
+    idx = len(clips) - 1
+    return clips, _gallery_items(clips), str(clip_path), f"✅ Added clip #{idx + 1} ({start:.2f}-{end:.2f}s).", idx
+
+
+def update_clip(dims, clips, idx, marks, x, y, w, h):
+    clips = list(clips or [])
+    marks = marks or {}
+    if idx is None or idx < 0 or idx >= len(clips):
+        return clips, _gallery_items(clips), None, "⚠️ Select a clip from the gallery first.", idx
+    if not dims:
+        return clips, _gallery_items(clips), None, "⚠️ Load a video first.", idx
+    start, end = marks.get("start"), marks.get("end")
+    if start is None or end is None:
+        return clips, _gallery_items(clips), None, "⚠️ Mark both a start and an end time first.", idx
+    if end <= start:
+        return clips, _gallery_items(clips), None, "❌ End must be after start.", idx
+    video = Path(dims["path"])
+    crop = f"{int(w)}:{int(h)}:{int(x)}:{int(y)}"
+    try:
+        clip_path = _render_clip(video, start, end, crop)
+    except subprocess.CalledProcessError as exc:
+        return clips, _gallery_items(clips), None, f"❌ ffmpeg failed: {exc}", idx
+    thumb = _render_clip_thumb(clip_path)
+    clips[idx] = {"start": start, "end": end, "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+                  "crop": crop, "video": str(clip_path), "thumb": thumb}
+    return clips, _gallery_items(clips), str(clip_path), f"✅ Updated clip #{idx + 1}.", idx
+
+
+def delete_clip(clips, idx):
+    clips = list(clips or [])
+    if idx is None or idx < 0 or idx >= len(clips):
+        return clips, _gallery_items(clips), None, "⚠️ Select a clip to delete.", -1
+    removed = clips.pop(idx)
+    return (clips, _gallery_items(clips), None,
+            f"🗑️ Deleted clip ({removed['start']:.2f}-{removed['end']:.2f}s).", -1)
+
+
+def select_clip(dims, clips, evt: gr.SelectData):
+    """Load the selected clip's start/end marks and crop back into the editor."""
+    clips = list(clips or [])
+    idx = evt.index
+    if not dims or idx is None or not (0 <= idx < len(clips)):
+        return (gr.update(),) * 16
+    c = clips[idx]
+    cx, cy, cw, ch = c["x"], c["y"], c["w"], c["h"]
+    snap = WORK_DIR / f"snap_{uuid.uuid4().hex}.png"
+    grab_frame(Path(dims["path"]), c["start"], snap)
+    annot = annot_value(str(snap), cx, cy, cw, ch)
+    marks = {"start": c["start"], "end": c["end"], "target": "end"}
+    return (
+        idx, cx, cy, cw, ch, annot, str(snap), (cx, cy, cw, ch),
+        gr.update(value=c["start"]), gr.update(value=round(c["start"], 3)), c["start"],
+        marks,
+        gr.update(value=_mark_button_label("▶ Start", c["start"]), variant="secondary"),
+        gr.update(value=_mark_button_label("⏹ End", c["end"]), variant="primary"),
+        c["video"],
+        f"▶️ Clip #{idx + 1} loaded ({c['start']:.2f}-{c['end']:.2f}s).",
+    )
+
+
+def compile_reel(dims, clips, fade, output_path):
+    clips = list(clips or [])
     if not dims:
         return None, "⚠️ Load a video first."
-    included = [s for s in sections if s.get("include", True)]
-    if not included:
-        return None, "⚠️ Mark at least one section as included before compiling."
+    if not clips:
+        return None, "⚠️ Add at least one clip before compiling."
     video = Path(dims["path"])
     output_path = _selector_path(output_path)
     out = _clean_path(output_path)
@@ -647,13 +661,13 @@ def compile_reel(dims, sections, fade, output_path):
         out = out / default_name
     out = out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    segments = [{"start": s["start"], "end": s["end"], "type": f"c{i}"} for i, s in enumerate(included)]
-    crops = {f"c{i}": s["crop"] for i, s in enumerate(included)}
+    segments = [{"start": c["start"], "end": c["end"], "type": f"c{i}"} for i, c in enumerate(clips)]
+    crops = {f"c{i}": c["crop"] for i, c in enumerate(clips)}
     try:
         reel.format_reel(video, segments, crops, out, fade=float(fade or 0.0))
     except subprocess.CalledProcessError as exc:
         return None, f"❌ ffmpeg failed: {exc}"
-    return str(out), f"✅ Compiled {len(included)} section(s) into: {out}"
+    return str(out), f"✅ Compiled {len(clips)} clip(s) into: {out}"
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -766,14 +780,15 @@ def build_app() -> gr.Blocks:
                                      [cc_log, cc_select, cc_preview])
                         cc_select.change(lambda p: p, cc_select, cc_preview)
 
-                    # ── 3b: Reel compilation (razor/split timeline editor) ─────
+                    # ── 3b: Reel compilation (independent clips, frame-accurate marking) ──
                     with gr.Tab("Reel compilation"):
-                        sections_state = gr.State([])    # ordered contiguous sections
+                        clips_state = gr.State([])       # list of independent clips
                         dims_state = gr.State(None)
                         snapshot_state = gr.State(None)  # current playhead frame PNG
-                        selected_state = gr.State(-1)    # selected section index
+                        selected_state = gr.State(-1)    # selected clip index
                         crop_state = gr.State(None)      # echo guard for crop sync
                         playhead_state = gr.State(0.0)   # frame-snapped playhead time
+                        marks_state = gr.State({"start": None, "end": None, "target": "start"})
 
                         rc_video_file = gr.File(label="Video", file_types=["video", ".mp4", ".mov", ".mkv"])
                         rc_compile = gr.Button("🎬 Create reel", elem_id="create-reel-btn")
@@ -785,7 +800,7 @@ def build_app() -> gr.Blocks:
                                 gr.Markdown("### Source")
                                 rc_video = gr.Video(label="Uploaded video")
 
-                            # Middle: timeline editor + crop
+                            # Middle: playhead, marking, crop
                             with gr.Column(scale=1):
                                 gr.Markdown("### Playhead & crop")
                                 rc_playhead = gr.Slider(0, 1, value=0, step=1 / 30,
@@ -808,25 +823,29 @@ def build_app() -> gr.Blocks:
                                 with gr.Row():
                                     rc_w = gr.Number(label="Crop W", value=0, precision=0)
                                     rc_h = gr.Number(label="Crop H", value=0, precision=0)
+                                gr.Markdown("Click **Start** or **End** to choose which mark the next "
+                                            "Split press (over)writes.")
                                 with gr.Row():
-                                    rc_split = gr.Button("✂️ Split at playhead", variant="primary")
-                                    rc_merge = gr.Button("🔗 Merge selected")
-                                rc_include = gr.Checkbox(label="Include selected section in reel",
-                                                         value=True)
+                                    rc_mark_start = gr.Button("▶ Start: not set", variant="primary")
+                                    rc_mark_end = gr.Button("⏹ End: not set", variant="secondary")
+                                rc_split = gr.Button("✂️ Split at playhead", variant="primary")
+                                with gr.Row():
+                                    rc_add = gr.Button("➕ Add clip", variant="primary")
+                                    rc_update = gr.Button("✏️ Update selected")
+                                    rc_delete = gr.Button("🗑️ Delete selected", variant="stop")
 
-                            # Right: sections list + preview
+                            # Right: clip list + preview
                             with gr.Column(scale=1):
-                                gr.Markdown("### Sections")
-                                rc_preview = gr.Video(label="Selected section preview")
-                                # No fixed height: the gallery grows with the sections and
-                                # the page scrolls, so every section stays reachable.
-                                rc_gallery = gr.Gallery(label="Sections (click to select)",
+                                gr.Markdown("### Clips")
+                                rc_preview = gr.Video(label="Selected clip preview")
+                                # No fixed height: the gallery grows with the clips and the
+                                # page scrolls, so every clip stays reachable/clickable.
+                                rc_gallery = gr.Gallery(label="Clips (click to select)",
                                                         columns=2, object_fit="cover",
                                                         allow_preview=False)
-                                rc_delete = gr.Button("🗑️ Delete selected section", variant="stop")
 
                         rc_fade = gr.Slider(0, 2.0, value=0.0, step=0.05,
-                                            label="Fade in/out per section (s, 0 = off)")
+                                            label="Fade in/out per clip (s, 0 = off)")
                         rc_reel_out = with_folder_picker("Reel output folder (optional)",
                                                          "Leave empty to just download the result below")
                         rc_final = gr.Video(label="Compiled reel")
@@ -835,68 +854,71 @@ def build_app() -> gr.Blocks:
                         rc_video_file.change(
                             load_reel_source, [rc_video_file],
                             [rc_video, dims_state, rc_playhead, rc_time,
-                             rc_x, rc_y, rc_w, rc_h, sections_state, rc_gallery,
+                             rc_x, rc_y, rc_w, rc_h, clips_state, rc_gallery,
                              rc_annotator, snapshot_state, rc_preview, rc_status,
-                             crop_state, selected_state, playhead_state, rc_include],
+                             crop_state, selected_state, playhead_state,
+                             marks_state, rc_mark_start, rc_mark_end],
                         )
 
                         # Playhead: render the frame only on release + step buttons.
                         playhead_out = [snapshot_state, rc_annotator, rc_x, rc_y, rc_w, rc_h,
                                         crop_state, playhead_state, rc_time, rc_playhead]
-                        playhead_in = [dims_state, sections_state, selected_state, rc_playhead]
-                        step_in = [dims_state, sections_state, selected_state, playhead_state]
+                        playhead_in = [dims_state, crop_state, rc_playhead]
+                        step_in = [dims_state, crop_state, playhead_state]
                         rc_playhead.release(render_playhead, playhead_in, playhead_out)
                         rc_back_s.click(functools.partial(step_seconds, secs=-1.0), step_in, playhead_out)
                         rc_fwd_s.click(functools.partial(step_seconds, secs=1.0), step_in, playhead_out)
                         rc_back_f.click(functools.partial(step_frame, n_frames=-1), step_in, playhead_out)
                         rc_fwd_f.click(functools.partial(step_frame, n_frames=1), step_in, playhead_out)
 
-                        # Crop editing (draw ↔ numbers), retargeted to the selected section.
-                        crop_io = [rc_annotator, rc_x, rc_y, rc_w, rc_h, crop_state,
-                                   sections_state, rc_gallery]
+                        # Crop editing (draw ↔ numbers) — independent of any clip; whatever
+                        # crop is "current" gets captured into the next Add/Update press.
+                        crop_io = [rc_annotator, rc_x, rc_y, rc_w, rc_h, crop_state]
                         rc_annotator.change(
-                            on_draw,
-                            [rc_annotator, dims_state, snapshot_state, crop_state,
-                             sections_state, selected_state],
-                            crop_io,
+                            on_draw, [rc_annotator, dims_state, snapshot_state, crop_state], crop_io,
                         )
                         for ctrl in (rc_x, rc_y, rc_w, rc_h):
                             ctrl.change(
                                 on_numbers,
-                                [rc_x, rc_y, rc_w, rc_h, dims_state, snapshot_state,
-                                 crop_state, sections_state, selected_state],
+                                [rc_x, rc_y, rc_w, rc_h, dims_state, snapshot_state, crop_state],
                                 crop_io,
                             )
 
-                        # Razor split / merge.
-                        section_edit_out = [sections_state, rc_gallery, rc_status,
-                                            selected_state, rc_preview]
-                        rc_split.click(split_section,
-                                       [dims_state, sections_state, selected_state, playhead_state],
-                                       section_edit_out)
-                        rc_merge.click(merge_section,
-                                       [dims_state, sections_state, selected_state],
-                                       section_edit_out)
-                        rc_delete.click(delete_section,
-                                        [sections_state, selected_state],
-                                        section_edit_out)
+                        # Start/End mark selector — picks which mark the next Split press writes.
+                        mark_btn_out = [marks_state, rc_mark_start, rc_mark_end]
+                        rc_mark_start.click(functools.partial(set_mark_target, target="start"),
+                                            [marks_state], mark_btn_out)
+                        rc_mark_end.click(functools.partial(set_mark_target, target="end"),
+                                          [marks_state], mark_btn_out)
 
-                        # Include toggle.
-                        rc_include.change(toggle_include,
-                                          [sections_state, selected_state, rc_include],
-                                          [sections_state, rc_gallery, rc_status])
+                        # Split at playhead: pure bookkeeping, records Start/End time only.
+                        rc_split.click(
+                            mark_at_playhead, [dims_state, marks_state, playhead_state],
+                            [marks_state, rc_mark_start, rc_mark_end, rc_status],
+                        )
 
-                        # Select a section.
+                        # Add / update / delete clips.
+                        clip_edit_out = [clips_state, rc_gallery, rc_preview, rc_status, selected_state]
+                        rc_add.click(create_clip,
+                                     [dims_state, clips_state, marks_state, rc_x, rc_y, rc_w, rc_h],
+                                     clip_edit_out)
+                        rc_update.click(update_clip,
+                                        [dims_state, clips_state, selected_state, marks_state,
+                                         rc_x, rc_y, rc_w, rc_h],
+                                        clip_edit_out)
+                        rc_delete.click(delete_clip, [clips_state, selected_state], clip_edit_out)
+
+                        # Select a clip — loads its start/end marks and crop back into the editor.
                         rc_gallery.select(
-                            select_section, [dims_state, sections_state],
+                            select_clip, [dims_state, clips_state],
                             [selected_state, rc_x, rc_y, rc_w, rc_h, rc_annotator,
-                             snapshot_state, crop_state, rc_playhead, rc_time,
-                             playhead_state, rc_include, rc_preview, rc_status],
+                             snapshot_state, crop_state, rc_playhead, rc_time, playhead_state,
+                             marks_state, rc_mark_start, rc_mark_end, rc_preview, rc_status],
                         )
 
                         # Compile.
                         rc_compile.click(
-                            compile_reel, [dims_state, sections_state, rc_fade, rc_reel_out],
+                            compile_reel, [dims_state, clips_state, rc_fade, rc_reel_out],
                             [rc_final, rc_status],
                         )
 
